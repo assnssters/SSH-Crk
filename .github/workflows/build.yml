@@ -53,6 +53,8 @@ jobs:
 
       - name: Build
         shell: bash
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Collect binaries
