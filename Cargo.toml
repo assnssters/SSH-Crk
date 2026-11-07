@@ -9,5 +9,6 @@ regex = "1"
 chrono = "0.4"
 crossbeam-channel = "0.5"
 
-# If you hit issues linking libssh2/OpenSSL, uncomment:
-# ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
