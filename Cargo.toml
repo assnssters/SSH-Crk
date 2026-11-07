@@ -1,0 +1,13 @@
+[package]
+name = "ssh-bruteforce"
+version = "2.6.0"
+edition = "2021"
+
+[dependencies]
+ssh2 = "0.9"
+regex = "1"
+chrono = "0.4"
+crossbeam-channel = "0.5"
+
+# If you hit issues linking libssh2/OpenSSL, uncomment:
+# ssh2 = { version = "0.9", features = ["vendored-openssl"] }
